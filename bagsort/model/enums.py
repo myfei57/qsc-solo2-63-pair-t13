@@ -41,3 +41,24 @@ class Verdict(str, Enum):
     FRESH = "fresh"
     REPLAYED = "replayed"
     ROLLED_OVER = "rolled_over"
+
+
+class RecheckPriority(str, Enum):
+    """Operator controlled urgency of a bag waiting for a second look."""
+
+    NORMAL = "normal"
+    URGENT = "urgent"
+
+
+class UrgentPlacement(str, Enum):
+    """Where an urgent arrival is allowed to cut in.
+
+    ``BEFORE_NORMAL`` only lifts urgent bags ahead of ordinary FIFO waiters;
+    bags already elevated (earlier urgents, age promoted bags) keep their place,
+    so a steady stream of urgent traffic cannot starve them. ``HEAD`` puts
+    urgent bags at the front of every non guarded class, which also pushes back
+    age promoted waiters; the flight cutoff guard still outranks it.
+    """
+
+    HEAD = "head"
+    BEFORE_NORMAL = "before_normal"

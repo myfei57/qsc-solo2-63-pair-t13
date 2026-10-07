@@ -4,17 +4,82 @@ from __future__ import annotations
 
 from bagsort.checkin.entries import Entry
 from bagsort.model.entities import Flight, Reading
+from bagsort.model.enums import RecheckPriority, UrgentPlacement
+from bagsort.model.reorder import entry_class
 from bagsort.model.validate import validate_flight
 from bagsort.reporting import csv_export
 from bagsort.sequence.allocator import preview
 from bagsort.store.replay import replay
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import Request, RequestError, Response, csv_response, json_response, text_response
 from .routes import route_table
 from .version import version_info
 
 
 def _plant(server):
     return server.plant
+
+
+def _priority(request: Request) -> RecheckPriority:
+    try:
+        return RecheckPriority(request.str_field("priority", RecheckPriority.NORMAL.value))
+    except ValueError:
+        raise RequestError(400, "priority must be 'normal' or 'urgent'") from None
+
+
+def _placement(request: Request, name: str = "placement") -> UrgentPlacement | None:
+    raw = request.str_field(name)
+    if not raw:
+        return None
+    try:
+        return UrgentPlacement(raw)
+    except ValueError:
+        raise RequestError(
+            400, f"field {name} must be 'head' or 'before_normal'"
+        ) from None
+
+
+def _move_payload(result: dict) -> dict:
+    """Render a queue mutation result, including per bag promotions."""
+
+    return {
+        key: value
+        for key, value in result.items()
+        if key != "promotions"
+    } | {
+        "promotions": [
+            {
+                "bag_id": move.bag_id,
+                "reason": move.reason,
+                "from_class": move.from_class,
+                "to_class": move.to_class,
+                "cutoff_at": move.cutoff_at,
+                "displaced": list(move.displaced),
+            }
+            for move in result.get("promotions", [])
+        ]
+    }
+
+
+def _move_payload(result: dict) -> dict:
+    """Render a queue mutation result, including per bag promotions."""
+
+    return {
+        key: value
+        for key, value in result.items()
+        if key != "promotions"
+    } | {
+        "promotions": [
+            {
+                "bag_id": move.bag_id,
+                "reason": move.reason,
+                "from_class": move.from_class,
+                "to_class": move.to_class,
+                "cutoff_at": move.cutoff_at,
+                "displaced": list(move.displaced),
+            }
+            for move in result.get("promotions", [])
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -513,8 +578,14 @@ def handle_in_transit(server, request: Request) -> Response:
 
 
 def handle_enqueue_recheck(server, request: Request) -> Response:
-    bag = _plant(server).enqueue_recheck(request.required("bag_id"))
-    return json_response({"bag_id": bag.id, "length": _plant(server).recheck.length()}, status=201)
+    plant = _plant(server)
+    bag, result = plant.enqueue_recheck(
+        request.required("bag_id"), _priority(request), _placement(request)
+    )
+    return json_response(
+        {"bag_id": bag.id, "length": plant.recheck.length(), "result": _move_payload(result)},
+        status=201,
+    )
 
 
 def handle_next_recheck(server, request: Request) -> Response:
@@ -524,15 +595,73 @@ def handle_next_recheck(server, request: Request) -> Response:
     return json_response(bag.as_dict())
 
 
+def handle_recheck_rebalance(server, request: Request) -> Response:
+    return json_response(_move_payload(_plant(server).rebalance_recheck()))
+
+
+def handle_recheck_priority(server, request: Request) -> Response:
+    plant = _plant(server)
+    result = plant.set_recheck_priority(
+        request.required("bag_id"), _priority(request), _placement(request)
+    )
+    return json_response(_move_payload(result))
+
+
+def handle_recheck_policy(server, request: Request) -> Response:
+    plant = _plant(server)
+    ageing = request.int_field("ageing_after_seconds", -1)
+    cutoff_lead = request.int_field("cutoff_lead_seconds", -1)
+    policy = plant.set_recheck_policy(
+        urgent_placement=_placement(request, "urgent_placement"),
+        ageing_after_seconds=ageing if ageing >= 0 else None,
+        cutoff_lead_seconds=cutoff_lead if cutoff_lead >= 0 else None,
+    )
+    return json_response(policy.as_dict())
+
+
+def handle_recheck_policy_get(server, request: Request) -> Response:
+    return json_response(_plant(server).recheck.policy().as_dict())
+
+
+def handle_recheck_order(server, request: Request) -> Response:
+    return json_response(_plant(server).recheck.order())
+
+
+def handle_recheck_crosscheck(server, request: Request) -> Response:
+    report = _plant(server).recheck_crosscheck()
+    return json_response(report)
+
+
 def handle_recheck_peek(server, request: Request) -> Response:
     bag = _plant(server).recheck.peek()
     if bag is None:
         return json_response({"error": "empty"}, status=404)
-    return json_response(bag.as_dict())
+    payload = bag.as_dict()
+    entry = _plant(server).store.state().recheck_entries.get(bag.id)
+    if entry is not None:
+        payload["priority"] = entry.priority.value
+        payload["class"] = entry_class(entry)
+    return json_response(payload)
 
 
 def handle_recheck_items(server, request: Request) -> Response:
-    return json_response([bag.as_dict() for bag in _plant(server).recheck.items()])
+    plant = _plant(server)
+    state = plant.store.state()
+    rows = []
+    for bag in plant.recheck.items():
+        entry = state.recheck_entries[bag.id]
+        row = bag.as_dict()
+        row.update(
+            {
+                "priority": entry.priority.value,
+                "class": entry_class(entry),
+                "arrival_seq": entry.arrival_seq,
+                "age_promoted": entry.age_promoted,
+                "cutoff_guarded": entry.cutoff_guarded,
+            }
+        )
+        rows.append(row)
+    return json_response(rows)
 
 
 def handle_recheck_deadline(server, request: Request) -> Response:

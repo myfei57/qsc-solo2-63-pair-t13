@@ -1,7 +1,7 @@
-"""First in, first out recheck backlog."""
+"""Prioritised recheck backlog with ageing and cutoff protection."""
 
 from __future__ import annotations
 
-from .queue import RecheckQueue
+from .queue import QueueMove, RecheckQueue
 
-__all__ = ["RecheckQueue"]
+__all__ = ["QueueMove", "RecheckQueue"]

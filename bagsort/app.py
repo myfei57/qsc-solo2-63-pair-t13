@@ -22,6 +22,7 @@ from bagsort.flight.schedule import ScheduleBoard
 from bagsort.ids import IdFactory
 from bagsort.inject.injector import Injector
 from bagsort.model.entities import Bag, Flight, Reading, SortRecord
+from bagsort.model.enums import RecheckPriority, UrgentPlacement
 from bagsort.model.errors import unknown_bag
 from bagsort.ns.chutes import ChuteRegistry
 from bagsort.ns.namespace import Namespace
@@ -113,6 +114,12 @@ class Plant:
             "bag.sorted",
             "bag.diverted",
             "bag.recheck_enqueued",
+            "bag.recheck_processed",
+            "recheck.priority_changed",
+            "recheck.age_promoted",
+            "recheck.cutoff_guarded",
+            "recheck.reordered",
+            "recheck.policy_set",
             "flight.closed",
             "chute.assigned",
             "belt.switched",
@@ -220,14 +227,136 @@ class Plant:
         self.bus.publish("flight.closed", flight_id=flight_id)
         return flight
 
-    def enqueue_recheck(self, bag_id: str) -> Bag:
+    def enqueue_recheck(
+        self,
+        bag_id: str,
+        priority: RecheckPriority = RecheckPriority.NORMAL,
+        placement: UrgentPlacement | None = None,
+    ) -> tuple[Bag, dict]:
         bag = self.bag(bag_id)
-        self.recheck.enqueue(bag)
-        self.bus.publish("bag.recheck_enqueued", bag_id=bag_id)
-        return bag
+        result = self.recheck.enqueue(bag, priority=priority, placement=placement)
+        if result["placed"]:
+            for move in result["promotions"]:
+                self.bus.publish(
+                    f"recheck.{_promotion_topic(move.reason)}",
+                    bag_id=move.bag_id,
+                    reason=move.reason,
+                    from_class=move.from_class,
+                    to_class=move.to_class,
+                    cutoff_at=move.cutoff_at,
+                    displaced=list(move.displaced),
+                )
+                self._publish_reorder(move)
+            self.bus.publish(
+                "bag.recheck_enqueued",
+                bag_id=bag_id,
+                priority=result["priority"],
+                urgency_class=result["class"],
+                displaced=result["displaced"],
+            )
+            if result["displaced"]:
+                self.bus.publish(
+                    "recheck.reordered",
+                    subject="queue",
+                    trigger="enqueue",
+                    promoted=bag_id,
+                    displaced=result["displaced"],
+                )
+        return bag, result
+
+    def _publish_reorder(self, move) -> None:
+        self.bus.publish(
+            "recheck.reordered",
+            subject="queue",
+            trigger=move.reason,
+            promoted=move.bag_id,
+            displaced=list(move.displaced),
+        )
+
+    def set_recheck_priority(
+        self,
+        bag_id: str,
+        priority: RecheckPriority,
+        placement: UrgentPlacement | None = None,
+    ) -> dict:
+        result = self.recheck.set_priority(bag_id, priority, placement)
+        if result["changed"]:
+            for move in result["promotions"]:
+                self.bus.publish(
+                    f"recheck.{_promotion_topic(move.reason)}",
+                    bag_id=move.bag_id,
+                    reason=move.reason,
+                    from_class=move.from_class,
+                    to_class=move.to_class,
+                    cutoff_at=move.cutoff_at,
+                    displaced=list(move.displaced),
+                )
+                self._publish_reorder(move)
+            self.bus.publish(
+                "recheck.priority_changed",
+                bag_id=bag_id,
+                priority=priority.value,
+                from_class=result["from_class"],
+                to_class=result["to_class"],
+                displaced=result["displaced"],
+            )
+            self.bus.publish(
+                "recheck.reordered",
+                subject="queue",
+                trigger="priority",
+                promoted=bag_id,
+                displaced=result["displaced"],
+            )
+        return result
+
+    def rebalance_recheck(self) -> dict:
+        result = self.recheck.rebalance()
+        if result["changed"]:
+            for move in result["promotions"]:
+                self.bus.publish(
+                    f"recheck.{_promotion_topic(move.reason)}",
+                    bag_id=move.bag_id,
+                    reason=move.reason,
+                    from_class=move.from_class,
+                    to_class=move.to_class,
+                    cutoff_at=move.cutoff_at,
+                    displaced=list(move.displaced),
+                )
+                self._publish_reorder(move)
+        return result
+
+    def set_recheck_policy(
+        self,
+        urgent_placement: UrgentPlacement | None = None,
+        ageing_after_seconds: int | None = None,
+        cutoff_lead_seconds: int | None = None,
+    ):
+        policy = self.recheck.set_policy(
+            urgent_placement, ageing_after_seconds, cutoff_lead_seconds
+        )
+        self.bus.publish("recheck.policy_set", subject="queue", policy=policy.as_dict())
+        return policy
+
+    def recheck_crosscheck(self) -> dict:
+        return self.recheck.crosscheck(audit=self.audit)
 
     def process_recheck(self) -> Bag | None:
-        return self.recheck.dequeue()
+        bag, moves = self.recheck.dequeue_detailed()
+        if bag is None:
+            return None
+        for move in moves:
+            self.bus.publish(
+                f"recheck.{_promotion_topic(move.reason)}",
+                bag_id=move.bag_id,
+                reason=move.reason,
+                from_class=move.from_class,
+                to_class=move.to_class,
+                cutoff_at=move.cutoff_at,
+                displaced=list(move.displaced),
+            )
+            self._publish_reorder(move)
+        self.bus.publish("bag.recheck_processed", bag_id=bag.id)
+        return bag
 
     def switch_belt(self, carousel: str, batch: int) -> int:
         cleared = self.belt.switch(carousel, batch)
@@ -255,6 +384,12 @@ class _AuditSubscriber:
         "bag.sorted": ("sort", "sorter"),
         "bag.diverted": ("diversion", "sorter"),
         "bag.recheck_enqueued": ("recheck", "recheck"),
+        "bag.recheck_processed": ("recheck_processed", "recheck"),
+        "recheck.priority_changed": ("recheck_priority", "recheck"),
+        "recheck.age_promoted": ("recheck_ageing", "recheck"),
+        "recheck.cutoff_guarded": ("recheck_cutoff", "recheck"),
+        "recheck.reordered": ("recheck_reorder", "recheck"),
+        "recheck.policy_set": ("recheck_policy", "recheck"),
         "flight.closed": ("flight_close", "audit"),
         "chute.assigned": ("chute_assign", "chute"),
         "belt.switched": ("belt_switch", "belt"),
@@ -273,11 +408,16 @@ class _AuditSubscriber:
             event.payload.get("bag_id")
             or event.payload.get("flight_id")
             or event.payload.get("carousel")
+            or event.payload.get("subject")
             or ""
         )
         detail = {
             key: value
             for key, value in event.payload.items()
-            if key not in {"bag_id", "flight_id"}
+            if key not in {"bag_id", "flight_id", "subject"}
         }
         self._audit.record(kind, subject, stage, detail)
+
+
+def _promotion_topic(reason: str) -> str:
+    return "cutoff_guarded" if reason == "cutoff" else "age_promoted"

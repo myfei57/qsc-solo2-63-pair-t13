@@ -16,11 +16,15 @@ from .entities import (
     ChuteAssignment,
     Flight,
     LoadRecord,
+    RecheckEntry,
+    RecheckPolicy,
     Sequence,
     SortRecord,
     TransferCommand,
 )
+from .reorder import ordered_entries
 from bagsort.errors import ValidationError
+from .enums import RecheckPriority, UrgentPlacement
 
 
 @dataclass
@@ -38,6 +42,9 @@ class State:
     quota_limits: dict[str, int] = field(default_factory=dict)
     counters: dict[str, int] = field(default_factory=dict)
     sequence: Sequence = field(default_factory=Sequence)
+    recheck_entries: dict[str, RecheckEntry] = field(default_factory=dict)
+    recheck_seq: int = 0
+    recheck_policy: RecheckPolicy = field(default_factory=RecheckPolicy)
     recheck_queue: list[str] = field(default_factory=list)
     belt_carousel: str = ""
     belt_batch: int = 0
@@ -56,6 +63,9 @@ class State:
             quota_limits=dict(self.quota_limits),
             counters=dict(self.counters),
             sequence=self.sequence,
+            recheck_entries=dict(self.recheck_entries),
+            recheck_seq=self.recheck_seq,
+            recheck_policy=self.recheck_policy,
             recheck_queue=list(self.recheck_queue),
             belt_carousel=self.belt_carousel,
             belt_batch=self.belt_batch,
@@ -77,6 +87,11 @@ class State:
             "quota_limits": dict(sorted(self.quota_limits.items())),
             "counters": dict(sorted(self.counters.items())),
             "sequence": self.sequence.as_dict(),
+            "recheck_entries": {
+                key: value.as_dict() for key, value in sorted(self.recheck_entries.items())
+            },
+            "recheck_seq": self.recheck_seq,
+            "recheck_policy": self.recheck_policy.as_dict(),
             "recheck_queue": list(self.recheck_queue),
             "belt": {
                 "carousel": self.belt_carousel,
@@ -84,6 +99,12 @@ class State:
                 "on_carousel": list(self.belt_on_carousel),
             },
         }
+
+def _reorder_recheck(state: State) -> None:
+    """Rebuild the exposed queue order from the committed entries."""
+
+    state.recheck_queue = [entry.bag_id for entry in ordered_entries(state.recheck_entries.values())]
+
 
 def apply_entry(state: State, kind: str, payload: dict[str, Any]) -> None:
     """Apply one journal command to ``state`` in place."""
@@ -134,13 +155,51 @@ def apply_entry(state: State, kind: str, payload: dict[str, Any]) -> None:
         name = str(payload["name"])
         state.counters[name] = state.counters.get(name, 0) + int(payload["delta"])
     elif kind == "recheck.enqueue":
+        raw = payload.get("entry") if isinstance(payload.get("entry"), dict) else payload
+        entry = RecheckEntry.from_dict(raw)
+        if entry.arrival_seq == 0:
+            # Snapshots written before the prioritised queue: recover FIFO
+            # order from the order the legacy enqueue commands were replayed.
+            state.recheck_seq += 1
+            entry = entry.evolved(arrival_seq=state.recheck_seq)
+        else:
+            state.recheck_seq = max(state.recheck_seq, entry.arrival_seq)
+        state.recheck_entries[entry.bag_id] = entry
+        _reorder_recheck(state)
+    elif kind == "recheck.priority":
         bag_id = str(payload["bag_id"])
-        if bag_id not in state.recheck_queue:
-            state.recheck_queue.append(bag_id)
+        current = state.recheck_entries[bag_id]
+        state.recheck_entries[bag_id] = current.evolved(
+            priority=RecheckPriority(str(payload["priority"])),
+            placement=UrgentPlacement(str(payload["placement"])),
+        )
+        _reorder_recheck(state)
+    elif kind == "recheck.age":
+        bag_id = str(payload["bag_id"])
+        current = state.recheck_entries[bag_id]
+        if not current.age_promoted:
+            state.recheck_entries[bag_id] = current.evolved(
+                age_promoted=True, aged_at=str(payload.get("at", current.aged_at))
+            )
+            _reorder_recheck(state)
+    elif kind == "recheck.guard":
+        bag_id = str(payload["bag_id"])
+        current = state.recheck_entries[bag_id]
+        if not current.cutoff_guarded:
+            state.recheck_entries[bag_id] = current.evolved(
+                cutoff_guarded=True,
+                guarded_at=str(payload.get("at", current.guarded_at)),
+                cutoff_at=str(payload.get("cutoff_at", current.cutoff_at)),
+            )
+            _reorder_recheck(state)
+    elif kind == "recheck.policy":
+        state.recheck_policy = RecheckPolicy.from_dict(payload["policy"])
     elif kind == "recheck.dequeue":
         bag_id = str(payload["bag_id"])
-        state.recheck_queue = [item for item in state.recheck_queue if item != bag_id]
+        state.recheck_entries.pop(bag_id, None)
+        _reorder_recheck(state)
     elif kind == "recheck.clear":
+        state.recheck_entries = {}
         state.recheck_queue = []
     elif kind == "belt.set":
         state.belt_carousel = str(payload.get("carousel", ""))

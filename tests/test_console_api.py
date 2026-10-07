@@ -162,8 +162,15 @@ def test_recheck_and_belt_endpoints(server):
     call(server, "POST", "/api/bags/checkin", {"barcode": "4001", "flight_id": flight_id})
     assert call(server, "POST", "/api/recheck", {"bag_id": "T1-4001"})[1]["length"] == 1
     assert call(server, "GET", "/api/recheck/peek")[1]["id"] == "T1-4001"
-    assert call(server, "GET", "/api/recheck/items")[1][0]["id"] == "T1-4001"
+    items = call(server, "GET", "/api/recheck/items")[1]
+    assert items[0]["id"] == "T1-4001"
+    assert items[0]["class"] == "normal"
+    order = call(server, "GET", "/api/recheck/order")[1]
+    assert order[0]["bag_id"] == "T1-4001"
+    assert order[0]["position"] == 0
     assert call(server, "GET", f"/api/recheck/deadline/{flight_id}")[1]["schedule"]["generation"] == 1
+    crosscheck = call(server, "GET", "/api/recheck/crosscheck")[1]
+    assert crosscheck["ok"] is True and crosscheck["audit_intact"] is True
     assert call(server, "POST", "/api/recheck/next")[1]["id"] == "T1-4001"
     assert call(server, "POST", "/api/recheck/clear")[1]["dropped"] == 0
 
@@ -176,6 +183,82 @@ def test_recheck_and_belt_endpoints(server):
     assert call(server, "POST", "/api/belt/switch", {"carousel": "T1-CRCR2", "batch": 2})[1]["cleared"] == 1
     assert call(server, "GET", "/api/belt/loads")[1][0]["carousel"] == "T1-CRCR1"
     assert call(server, "POST", "/api/belt/rotate")[1]["dropped"] == 0
+
+
+def test_prioritised_recheck_endpoints(server):
+    flight_id = bootstrap(server)
+    for barcode in ("4101", "4102", "4103"):
+        call(server, "POST", "/api/bags/checkin", {"barcode": barcode, "flight_id": flight_id})
+    for bag_id in ("T1-4101", "T1-4102"):
+        assert call(server, "POST", "/api/recheck", {"bag_id": bag_id})[0] == 201
+
+    # urgent before_normal overtakes the honest waiters and names them
+    status, body = call(
+        server,
+        "POST",
+        "/api/recheck",
+        {"bag_id": "T1-4103", "priority": "urgent", "placement": "before_normal"},
+    )
+    assert status == 201
+    assert body["result"]["class"] == "elevated"
+    assert [item["bag_id"] for item in body["result"]["displaced"]] == ["T1-4101", "T1-4102"]
+    assert call(server, "GET", "/api/recheck/peek")[1]["id"] == "T1-4103"
+
+    # item by item priority revision
+    status, body = call(
+        server, "POST", "/api/recheck/priority",
+        {"bag_id": "T1-4101", "priority": "urgent", "placement": "head"},
+    )
+    assert status == 200 and body["to_class"] == "head_urgent"
+    assert call(server, "GET", "/api/recheck/peek")[1]["id"] == "T1-4101"
+
+    # bad enum values are 400, not 500
+    assert call(server, "POST", "/api/recheck/priority",
+                {"bag_id": "T1-4102", "priority": "screaming"})[0] == 400
+    assert call(server, "POST", "/api/recheck/policy",
+                {"urgent_placement": "anywhere"})[0] == 400
+
+    # policy is readable and writable
+    assert call(server, "GET", "/api/recheck/policy")[1]["urgent_placement"] == "before_normal"
+    status, body = call(
+        server, "POST", "/api/recheck/policy",
+        {"ageing_after_seconds": 120, "cutoff_lead_seconds": 900},
+    )
+    assert status == 200 and body["ageing_after_seconds"] == 120
+
+    # rebalance endpoint exists and reports no change once promoted
+    status, body = call(server, "POST", "/api/recheck/rebalance", {})
+    assert status == 200 and body["changed"] is False
+
+    # the cross check still reconciles order, cutoffs and audit
+    assert call(server, "GET", "/api/recheck/crosscheck")[1]["ok"] is True
+
+
+def test_recheck_ageing_and_cutoff_guard_endpoints(server):
+    flight_id = bootstrap(server)
+    call(server, "POST", "/api/flights", {"code": "CA9999", "carousel": "CR2"})
+    due_id = "T1-CA9999"
+    call(server, "POST", f"/api/flights/{due_id}/cutoff-time", {"cutoff": "2024-01-01T00:10:30Z"})
+    call(server, "POST", "/api/bags/checkin", {"barcode": "4201", "flight_id": flight_id})
+    call(server, "POST", "/api/bags/checkin", {"barcode": "4202", "flight_id": due_id})
+    call(server, "POST", "/api/recheck", {"bag_id": "T1-4201", "priority": "urgent",
+                                          "placement": "head"})
+    call(server, "POST", "/api/recheck", {"bag_id": "T1-4202"})
+    assert call(server, "GET", "/api/recheck/peek")[1]["id"] == "T1-4201"
+
+    # nothing is within the 600s guard window yet
+    assert call(server, "POST", "/api/recheck/rebalance", {})[1]["changed"] is False
+    # ageing lifts the honest waiter once the service clock crosses the window;
+    # the deterministic clock is driven through plant ops, so tighten the window
+    call(server, "POST", "/api/recheck/policy", {"cutoff_lead_seconds": 631})
+    status, body = call(server, "POST", "/api/recheck/rebalance", {})
+    assert status == 200 and body["changed"] is True
+    assert body["promotions"][0]["reason"] == "cutoff"
+    assert call(server, "GET", "/api/recheck/peek")[1]["id"] == "T1-4202"
+    # guarding is one shot
+    assert call(server, "POST", "/api/recheck/rebalance", {})[1]["changed"] is False
+    report = call(server, "GET", "/api/recheck/crosscheck")[1]
+    assert report["ok"] is True and report["issues"] == []
 
 
 def test_quota_and_audit_endpoints(server):

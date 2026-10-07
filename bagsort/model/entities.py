@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .enums import BagState, FlightState
+from .enums import BagState, FlightState, RecheckPriority, UrgentPlacement
 
 
 def _clean(raw: Any) -> Any:
@@ -249,6 +249,93 @@ class Sequence:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Sequence":
         return cls(epoch=int(raw.get("epoch", 0)), next_value=int(raw.get("next", 0)))
+
+
+@dataclass(frozen=True)
+class RecheckEntry:
+    """One bag's place in the prioritised recheck backlog.
+
+    ``arrival_seq`` is the monotonic stamp assigned when the bag entered the
+    queue and is the within class FIFO tie breaker. ``priority``/``placement``
+    are the operator's choice, recorded at enqueue and revised item by item.
+    ``age_promoted`` and ``cutoff_guarded`` are one shot automation marks, so
+    ageing never lifts the same bag twice and a near cutoff bag stays protected
+    even if it was already age promoted.
+    """
+
+    bag_id: str
+    flight_id: str = ""
+    arrival_at: str = ""
+    arrival_seq: int = 0
+    priority: RecheckPriority = RecheckPriority.NORMAL
+    placement: UrgentPlacement = UrgentPlacement.BEFORE_NORMAL
+    age_promoted: bool = False
+    cutoff_guarded: bool = False
+    cutoff_at: str = ""
+    aged_at: str = ""
+    guarded_at: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bag_id": self.bag_id,
+            "flight_id": self.flight_id,
+            "arrival_at": self.arrival_at,
+            "arrival_seq": self.arrival_seq,
+            "priority": self.priority.value,
+            "placement": self.placement.value,
+            "age_promoted": self.age_promoted,
+            "cutoff_guarded": self.cutoff_guarded,
+            "cutoff_at": self.cutoff_at,
+            "aged_at": self.aged_at,
+            "guarded_at": self.guarded_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RecheckEntry":
+        return cls(
+            bag_id=str(raw["bag_id"]),
+            flight_id=str(raw.get("flight_id", "")),
+            arrival_at=str(raw.get("arrival_at", "")),
+            arrival_seq=int(raw.get("arrival_seq", 0)),
+            priority=RecheckPriority(raw.get("priority", RecheckPriority.NORMAL.value)),
+            placement=UrgentPlacement(
+                raw.get("placement", UrgentPlacement.BEFORE_NORMAL.value)
+            ),
+            age_promoted=bool(raw.get("age_promoted", False)),
+            cutoff_guarded=bool(raw.get("cutoff_guarded", False)),
+            cutoff_at=str(raw.get("cutoff_at", "")),
+            aged_at=str(raw.get("aged_at", "")),
+            guarded_at=str(raw.get("guarded_at", "")),
+        )
+
+    def evolved(self, **changes: Any) -> "RecheckEntry":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class RecheckPolicy:
+    """Queue wide tuning for urgent insertion and the two auto promotions."""
+
+    urgent_placement: UrgentPlacement = UrgentPlacement.BEFORE_NORMAL
+    ageing_after_seconds: int = 300
+    cutoff_lead_seconds: int = 600
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "urgent_placement": self.urgent_placement.value,
+            "ageing_after_seconds": self.ageing_after_seconds,
+            "cutoff_lead_seconds": self.cutoff_lead_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RecheckPolicy":
+        return cls(
+            urgent_placement=UrgentPlacement(
+                raw.get("urgent_placement", UrgentPlacement.BEFORE_NORMAL.value)
+            ),
+            ageing_after_seconds=int(raw.get("ageing_after_seconds", 300)),
+            cutoff_lead_seconds=int(raw.get("cutoff_lead_seconds", 600)),
+        )
 
 
 @dataclass(frozen=True)
