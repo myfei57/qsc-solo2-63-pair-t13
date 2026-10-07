@@ -166,7 +166,6 @@ def test_recheck_and_belt_endpoints(server):
     assert call(server, "GET", f"/api/recheck/deadline/{flight_id}")[1]["schedule"]["generation"] == 1
     assert call(server, "POST", "/api/recheck/next")[1]["id"] == "T1-4001"
     assert call(server, "POST", "/api/recheck/clear")[1]["dropped"] == 0
-
     assert call(server, "POST", "/api/belt/set", {"carousel": "T1-CRCR1", "batch": 1})[1]["batch"] == 1
     assert call(server, "POST", "/api/belt/place", {"bag_id": "T1-4001"})[1]["on_carousel"] == 1
     assert len(call(server, "GET", "/api/belt/on-carousel")[1]) == 1
@@ -305,3 +304,66 @@ def test_wsgi_rejects_a_bad_body(tmp_path):
     chunks = server(environ, start_response)
     assert captured["status"].startswith("400")
     assert json.loads(b"".join(chunks))["error"]
+
+
+def test_priority_recheck_endpoints(server):
+    flight_id = bootstrap(server)
+    call(server, "POST", "/api/flights/" + flight_id + "/cutoff-time", {"cutoff": "2024-01-01T00:10:00Z"})
+    for code in ("5001", "5002", "5003"):
+        call(server, "POST", "/api/bags/checkin", {"barcode": code, "flight_id": flight_id})
+    for code in ("5001", "5002"):
+        status, body = call(server, "POST", "/api/recheck", {"bag_id": "T1-" + code})
+        assert status == 201 and body["priority"] == "normal"
+    # Head expedite overtakes both patient waiters and names them.
+    status, body = call(
+        server,
+        "POST",
+        "/api/recheck/expedite",
+        {"bag_id": "T1-5002", "policy": "head"},
+    )
+    assert status == 200
+    assert body["position"] == 0
+    assert body["starved"] == ["T1-5001"]
+
+    # The queue view joins order with flight cutoff data.
+    status, view = call(server, "GET", "/api/recheck/view")
+    assert status == 200
+    assert [row["bag_id"] for row in view] == ["T1-5002", "T1-5001"]
+    assert view[0]["priority"] == "priority"
+    assert view[0]["cutoff_at"] == "2024-01-01T00:10:00Z"
+
+    # Item-level manual band change.
+    status, body = call(
+        server,
+        "POST",
+        "/api/recheck/items/T1-5001/promote",
+        {"priority": "protected"},
+    )
+    assert status == 200 and body["cause"] == "manual"
+    status, entry = call(server, "GET", "/api/recheck/items/T1-5001")
+    assert entry["priority"] == "protected"
+
+    # Promotion history is reviewable entry by entry.
+    status, history = call(server, "GET", "/api/recheck/promotions")
+    assert status == 200
+    assert [row["bag_id"] for row in history] == ["T1-5002", "T1-5001"]
+    assert [row["cause"] for row in history] == ["manual", "manual"]
+
+    # Aging pass promotes the late arrival once the clock passes the threshold.
+    call(server, "POST", "/api/recheck", {"bag_id": "T1-5003"})
+    call(server, "POST", "/api/recheck/reorder", {})
+    # No movement yet: 5003 just arrived.
+    status, before = call(server, "GET", "/api/recheck/view")
+    assert [row["bag_id"] for row in before][0] == "T1-5001"
+
+    # Bad enum values are 400s, not 500s.
+    assert call(server, "POST", "/api/recheck/expedite", {"bag_id": "T1-5003", "policy": "sideways"})[0] == 400
+    assert call(
+        server,
+        "POST",
+        "/api/recheck/items/T1-5003/promote",
+        {"priority": "urgent-ish"},
+    )[0] == 400
+
+    # Processing still serves band order.
+    assert call(server, "POST", "/api/recheck/next")[1]["id"] == "T1-5001"

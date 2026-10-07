@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bagsort.model.enums import ExpeditePolicy, RecheckPriority
 from bagsort.reporting import csv_export
 from tests.support import check_in
 
@@ -41,6 +42,18 @@ def test_flight_rows_join_flights_and_assignments(plant, flight):
     assert row["chute_generation"] == 1
     assert row["bags"] == 2
     assert row["state"] == "open"
+
+
+def test_summary_breaks_down_the_recheck_bands(plant, flight):
+    bags = check_in(plant, flight.id, 3)
+    plant.enqueue_recheck(bags[0].id)
+    plant.enqueue_recheck(bags[1].id)
+    plant.enqueue_recheck(bags[2].id, RecheckPriority.PRIORITY, ExpeditePolicy.HEAD)
+    summary = plant.report.summary()
+    assert summary["recheck_backlog"] == 3
+    assert summary["recheck_bands"] == {"normal": 2, "priority": 1, "protected": 0}
+    text = plant.report.text()
+    assert "recheck backlog   : 3" in text
 
 
 def test_csv_render_writes_a_header_and_rows():

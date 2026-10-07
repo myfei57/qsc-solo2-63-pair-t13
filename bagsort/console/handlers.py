@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from bagsort.checkin.entries import Entry
 from bagsort.model.entities import Flight, Reading
+from bagsort.model.enums import ExpeditePolicy, PromotionCause, RecheckPriority
 from bagsort.model.validate import validate_flight
 from bagsort.reporting import csv_export
 from bagsort.sequence.allocator import preview
 from bagsort.store.replay import replay
-from .http import Request, Response, csv_response, json_response, text_response
+from .http import (
+    Request,
+    RequestError,
+    Response,
+    csv_response,
+    json_response,
+    text_response,
+)
 from .routes import route_table
 from .version import version_info
 
@@ -513,8 +521,34 @@ def handle_in_transit(server, request: Request) -> Response:
 
 
 def handle_enqueue_recheck(server, request: Request) -> Response:
-    bag = _plant(server).enqueue_recheck(request.required("bag_id"))
-    return json_response({"bag_id": bag.id, "length": _plant(server).recheck.length()}, status=201)
+    plant = _plant(server)
+    result = plant.enqueue_recheck(
+        request.required("bag_id"),
+        priority=_enum_field(request, "priority", RecheckPriority, RecheckPriority.NORMAL),
+        policy=_expedite_policy(request),
+    )
+    return json_response(result.as_dict(), status=201)
+
+
+def handle_expedite_recheck(server, request: Request) -> Response:
+    plant = _plant(server)
+    result = plant.expedite_recheck(
+        request.required("bag_id"), policy=_expedite_policy(request)
+    )
+    return json_response(result.as_dict())
+
+
+def handle_promote_recheck(server, request: Request) -> Response:
+    plant = _plant(server)
+    priority = _enum_field(request, "priority", RecheckPriority)
+    cause = _enum_field(request, "cause", PromotionCause, PromotionCause.MANUAL)
+    promotion = plant.promote_recheck(request.param("id"), priority, cause)
+    return json_response(promotion.as_dict())
+
+
+def handle_reorder_recheck(server, request: Request) -> Response:
+    result = _plant(server).reorder_recheck()
+    return json_response(result.as_dict())
 
 
 def handle_next_recheck(server, request: Request) -> Response:
@@ -535,6 +569,18 @@ def handle_recheck_items(server, request: Request) -> Response:
     return json_response([bag.as_dict() for bag in _plant(server).recheck.items()])
 
 
+def handle_recheck_view(server, request: Request) -> Response:
+    return json_response([row.as_dict() for row in _plant(server).recheck.view()])
+
+
+def handle_recheck_promotions(server, request: Request) -> Response:
+    return json_response(_plant(server).recheck.promotion_history())
+
+
+def handle_recheck_entry(server, request: Request) -> Response:
+    return json_response(_plant(server).recheck.entry(request.param("id")).as_dict())
+
+
 def handle_recheck_deadline(server, request: Request) -> Response:
     plant = _plant(server)
     flight_id = request.param("flight")
@@ -551,8 +597,31 @@ def handle_recheck_deadline(server, request: Request) -> Response:
 
 
 def handle_recheck_clear(server, request: Request) -> Response:
-    dropped = _plant(server).recheck.clear()
+    plant = _plant(server)
+    dropped = plant.recheck.clear()
+    if dropped:
+        plant.bus.publish("recheck.cleared", dropped=dropped)
     return json_response({"dropped": dropped})
+
+
+def _enum_field(request: Request, name: str, enum_type, default=None):
+    value = request.str_field(name, getattr(default, "value", ""))
+    if not value:
+        raise RequestError(400, f"field {name} must not be empty")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise RequestError(400, f"unknown {name} {value!r}") from exc
+
+
+def _expedite_policy(request: Request):
+    value = request.str_field("policy", "")
+    if not value:
+        return None
+    try:
+        return ExpeditePolicy(value)
+    except ValueError as exc:
+        raise RequestError(400, f"unknown expedite policy {value!r}") from exc
 
 
 # ---------------------------------------------------------------------------

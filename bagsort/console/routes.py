@@ -112,11 +112,17 @@ def route_table() -> list[Route]:
         Route("GET", "/api/inject/{flight}/in-transit", "in-transit count", "handle_in_transit"),
         # -- recheck ------------------------------------------------------
         Route("POST", "/api/recheck", "enqueue a bag for recheck", "handle_enqueue_recheck"),
+        Route("POST", "/api/recheck/expedite", "expedite a queued bag", "handle_expedite_recheck"),
+        Route("POST", "/api/recheck/reorder", "run the aging and cutoff pass", "handle_reorder_recheck"),
+        Route("GET", "/api/recheck/view", "queue joined with flight cutoffs", "handle_recheck_view"),
+        Route("GET", "/api/recheck/promotions", "item by item priority changes", "handle_recheck_promotions"),
         Route("POST", "/api/recheck/next", "process the oldest recheck", "handle_next_recheck"),
         Route("GET", "/api/recheck/peek", "peek at the recheck queue", "handle_recheck_peek"),
         Route("GET", "/api/recheck/items", "list the recheck queue", "handle_recheck_items"),
-        Route("GET", "/api/recheck/deadline/{flight}", "cutoff for a flight", "handle_recheck_deadline"),
         Route("POST", "/api/recheck/clear", "clear the recheck queue", "handle_recheck_clear"),
+        Route("POST", "/api/recheck/items/{id}/promote", "change one bag's band", "handle_promote_recheck"),
+        Route("GET", "/api/recheck/items/{id}", "read one queue entry", "handle_recheck_entry"),
+        Route("GET", "/api/recheck/deadline/{flight}", "cutoff for a flight", "handle_recheck_deadline"),
         # -- belt ---------------------------------------------------------
         Route("GET", "/api/belt", "carousel and batch", "handle_belt_state"),
         Route("POST", "/api/belt/set", "set carousel and batch", "handle_belt_set"),

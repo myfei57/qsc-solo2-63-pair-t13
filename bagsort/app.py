@@ -22,12 +22,15 @@ from bagsort.flight.schedule import ScheduleBoard
 from bagsort.ids import IdFactory
 from bagsort.inject.injector import Injector
 from bagsort.model.entities import Bag, Flight, Reading, SortRecord
+from bagsort.model.enums import ExpeditePolicy, PromotionCause, RecheckPriority
 from bagsort.model.errors import unknown_bag
 from bagsort.ns.chutes import ChuteRegistry
 from bagsort.ns.namespace import Namespace
 from bagsort.ns.topology import handling_line
 from bagsort.quota.quota import QuotaBook
+from bagsort.recheck.policy import AgingPolicy
 from bagsort.recheck.queue import RecheckQueue
+from bagsort.recheck.records import EnqueueResult, Promotion, ReorderResult
 from bagsort.reporting.report import PlantReport
 from bagsort.sequence.verdict import VerdictTracker
 from bagsort.sorter.sorter import Sorter
@@ -103,7 +106,7 @@ class Plant:
         quota = QuotaBook(store, clock)
         desk = Desk(store, reader, book, mapping, injector, quota, clock, handling_line())
         closer = FlightCloser(book)
-        recheck = RecheckQueue(store, book, clock)
+        recheck = RecheckQueue(store, book, clock, AgingPolicy(), ExpeditePolicy.HEAD)
         belt = Belt(store, clock, IdFactory("cmd"))
 
         audit = AuditChain(store, clock, handling_line())
@@ -113,6 +116,11 @@ class Plant:
             "bag.sorted",
             "bag.diverted",
             "bag.recheck_enqueued",
+            "bag.recheck_expedited",
+            "bag.recheck_promoted",
+            "recheck.reordered",
+            "recheck.processed",
+            "recheck.cleared",
             "flight.closed",
             "chute.assigned",
             "belt.switched",
@@ -121,7 +129,7 @@ class Plant:
             bus.subscribe(topic, audit_subscriber)
 
         report = PlantReport(
-            store, book, chutes, belt, quota, audit, namespace, handling_line()
+            store, book, chutes, belt, quota, audit, namespace, handling_line(), recheck
         )
         return cls(
             store=store,
@@ -220,14 +228,88 @@ class Plant:
         self.bus.publish("flight.closed", flight_id=flight_id)
         return flight
 
-    def enqueue_recheck(self, bag_id: str) -> Bag:
+    def enqueue_recheck(
+        self,
+        bag_id: str,
+        priority: RecheckPriority = RecheckPriority.NORMAL,
+        policy: ExpeditePolicy | None = None,
+    ) -> EnqueueResult:
         bag = self.bag(bag_id)
-        self.recheck.enqueue(bag)
-        self.bus.publish("bag.recheck_enqueued", bag_id=bag_id)
-        return bag
+        result = self.recheck.enqueue(bag, priority=priority, policy=policy)
+        self.bus.publish(
+            "bag.recheck_enqueued",
+            bag_id=bag_id,
+            priority=result.priority.value,
+            policy=result.policy.value,
+            position=result.position,
+            starved=list(result.starved),
+        )
+        return result
+
+    def expedite_recheck(
+        self, bag_id: str, policy: ExpeditePolicy | None = None
+    ) -> EnqueueResult:
+        result = self.recheck.expedite(bag_id, policy=policy)
+        self.bus.publish(
+            "bag.recheck_expedited",
+            bag_id=bag_id,
+            policy=result.policy.value,
+            position=result.position,
+            starved=list(result.starved),
+        )
+        return result
+
+    def promote_recheck(
+        self,
+        bag_id: str,
+        priority: RecheckPriority,
+        cause: PromotionCause = PromotionCause.MANUAL,
+    ) -> Promotion:
+        promotion = self.recheck.promote(bag_id, priority, cause)
+        self.bus.publish(
+            "bag.recheck_promoted",
+            bag_id=bag_id,
+            priority=promotion.priority.value,
+            cause=promotion.cause.value,
+            position=self._recheck_position(bag_id),
+        )
+        return promotion
+
+    def reorder_recheck(self) -> ReorderResult:
+        result = self.recheck.reorder()
+        for promotion in result.promotions:
+            self.bus.publish(
+                "bag.recheck_promoted",
+                bag_id=promotion.bag_id,
+                priority=promotion.priority.value,
+                cause=promotion.cause.value,
+                waited_seconds=promotion.waited_seconds,
+                seconds_to_cutoff=promotion.seconds_to_cutoff,
+                position=self._recheck_position(promotion.bag_id),
+            )
+        self.bus.publish(
+            "recheck.reordered",
+            at=result.at,
+            moved=list(result.moved),
+            promotions=[
+                {
+                    "bag_id": promotion.bag_id,
+                    "priority": promotion.priority.value,
+                    "cause": promotion.cause.value,
+                }
+                for promotion in result.promotions
+            ],
+        )
+        return result
+
+    def _recheck_position(self, bag_id: str) -> int:
+        return self.store.state().recheck_queue.index(bag_id)
 
     def process_recheck(self) -> Bag | None:
-        return self.recheck.dequeue()
+        bag = self.recheck.dequeue()
+        if bag is not None:
+            self.bus.publish("recheck.processed", bag_id=bag.id)
+        return bag
 
     def switch_belt(self, carousel: str, batch: int) -> int:
         cleared = self.belt.switch(carousel, batch)
@@ -254,7 +336,12 @@ class _AuditSubscriber:
         "bag.checked_in": ("checkin", "checkin"),
         "bag.sorted": ("sort", "sorter"),
         "bag.diverted": ("diversion", "sorter"),
-        "bag.recheck_enqueued": ("recheck", "recheck"),
+        "bag.recheck_enqueued": ("recheck_enqueue", "recheck"),
+        "bag.recheck_expedited": ("recheck_expedite", "recheck"),
+        "bag.recheck_promoted": ("recheck_promote", "recheck"),
+        "recheck.reordered": ("recheck_reorder", "recheck"),
+        "recheck.processed": ("recheck_process", "recheck"),
+        "recheck.cleared": ("recheck_clear", "recheck"),
         "flight.closed": ("flight_close", "audit"),
         "chute.assigned": ("chute_assign", "chute"),
         "belt.switched": ("belt_switch", "belt"),
@@ -273,7 +360,7 @@ class _AuditSubscriber:
             event.payload.get("bag_id")
             or event.payload.get("flight_id")
             or event.payload.get("carousel")
-            or ""
+            or "recheck"
         )
         detail = {
             key: value

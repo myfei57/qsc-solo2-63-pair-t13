@@ -91,3 +91,76 @@ def test_invalid_snapshot_file_is_rejected(tmp_path):
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(ValidationError):
         Store.open(str(path))
+
+
+def test_legacy_recheck_enqueue_folds_as_a_normal_queue_entry(tmp_path):
+    """Streams written before priority bands existed carry only the bag id."""
+
+    store = Store(str(tmp_path / "state.json"))
+    with store.session() as session:
+        session.record(
+            "bag.put",
+            {"bag": {"id": "T1-1", "barcode": "1", "sequence": 1}},
+        )
+        session.record("recheck.enqueue", {"bag_id": "T1-1"})
+    state = store.state()
+    assert state.recheck_queue == ["T1-1"]
+    entry = state.recheck_entries["T1-1"]
+    assert entry.priority.value == "normal"
+    assert entry.aging_promoted is False
+
+
+def test_recheck_promote_and_reorder_replay_priority_order(tmp_path):
+    from bagsort.model.enums import RecheckPriority
+
+    store = Store(str(tmp_path / "state.json"))
+    with store.session() as session:
+        for bag_id, arrival in (("T1-a", 1), ("T1-b", 2)):
+            session.record(
+                "bag.put",
+                {"bag": {"id": bag_id, "barcode": bag_id, "sequence": arrival}},
+            )
+            session.record(
+                "recheck.enqueue",
+                {
+                    "entry": {
+                        "bag_id": bag_id,
+                        "arrival_seq": arrival,
+                        "enqueued_at": "2024-01-01T00:00:00Z",
+                        "effective_at": "2024-01-01T00:00:00Z",
+                        "priority": "normal",
+                    },
+                    "position": arrival - 1,
+                    "policy": "head",
+                },
+            )
+        session.record(
+            "recheck.promote",
+            {
+                "bag_id": "T1-b",
+                "priority": "priority",
+                "cause": "manual",
+                "at": "2024-01-01T00:01:00Z",
+            },
+        )
+        session.record("recheck.reorder", {"order": ["T1-b", "T1-a"]})
+    state = store.state()
+    assert state.recheck_queue == ["T1-b", "T1-a"]
+    assert state.recheck_entries["T1-b"].priority is RecheckPriority.PRIORITY
+
+
+def test_recheck_dequeue_removes_band_state_too(tmp_path):
+    store = Store(str(tmp_path / "state.json"))
+    with store.session() as session:
+        session.record(
+            "bag.put", {"bag": {"id": "T1-1", "barcode": "1", "sequence": 1}}
+        )
+        session.record(
+            "recheck.enqueue",
+            {"entry": {"bag_id": "T1-1", "arrival_seq": 1, "enqueued_at": "t"}},
+        )
+        session.record("recheck.dequeue", {"bag_id": "T1-1"})
+    state = store.state()
+    assert state.recheck_queue == []
+    assert state.recheck_entries == {}
+

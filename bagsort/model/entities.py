@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from .enums import BagState, FlightState
+from .enums import BagState, FlightState, RecheckPriority
 
 
 def _clean(raw: Any) -> Any:
@@ -98,6 +98,60 @@ class Bag:
         )
 
     def evolved(self, **changes: Any) -> "Bag":
+        return replace(self, **changes)
+
+
+@dataclass(frozen=True)
+class RecheckEntry:
+    """One bag's place in the priority recheck backlog.
+
+    ``arrival_seq`` assigns arrival order at enqueue time, so ties in the
+    one-second clock granularity still keep same-band ordering deterministic.
+    ``effective_at`` is when the bag entered its current band: arrivals use
+    their enqueue instant, promotions the promotion instant. Served order is
+    band strictness first and this effective time inside the band, which is what
+    keeps an aged patient bag ahead of expedites that arrive only afterwards
+    without letting it jump over expedites already waiting when it is lifted.
+    ``aging_promoted`` latches the one aging promotion a bag is allowed;
+    ``cutoff_promoted`` latches its one cutoff protection promotion.
+    """
+
+    bag_id: str
+    arrival_seq: int
+    enqueued_at: str
+    priority: RecheckPriority = RecheckPriority.NORMAL
+    effective_at: str = ""
+    aging_promoted: bool = False
+    cutoff_promoted: bool = False
+    last_promoted_at: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "bag_id": self.bag_id,
+            "arrival_seq": self.arrival_seq,
+            "enqueued_at": self.enqueued_at,
+            "priority": self.priority.value,
+            "effective_at": self.effective_at,
+            "aging_promoted": self.aging_promoted,
+            "cutoff_promoted": self.cutoff_promoted,
+            "last_promoted_at": self.last_promoted_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "RecheckEntry":
+        enqueued_at = str(raw.get("enqueued_at", ""))
+        return cls(
+            bag_id=str(raw["bag_id"]),
+            arrival_seq=int(raw.get("arrival_seq", 0)),
+            enqueued_at=enqueued_at,
+            priority=RecheckPriority(raw.get("priority", RecheckPriority.NORMAL.value)),
+            effective_at=str(raw.get("effective_at", enqueued_at)),
+            aging_promoted=bool(raw.get("aging_promoted", False)),
+            cutoff_promoted=bool(raw.get("cutoff_promoted", False)),
+            last_promoted_at=str(raw.get("last_promoted_at", "")),
+        )
+
+    def evolved(self, **changes: Any) -> "RecheckEntry":
         return replace(self, **changes)
 
 

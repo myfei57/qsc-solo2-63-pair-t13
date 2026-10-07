@@ -32,3 +32,17 @@ class Clock:
             raise ValueError("clock cannot move backwards")
         self._offset += seconds
         return self.now()
+
+
+def parse_iso(value: str) -> datetime | None:
+    """Parse the service's ``...Z`` timestamps; an empty value means 'unset'."""
+
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
